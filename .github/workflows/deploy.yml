@@ -1,0 +1,212 @@
+# name: Deploy Pipeline
+
+# on:
+#   workflow_dispatch:
+#     inputs:
+#       image-tag:
+#         description: 'Image tag to deploy'
+#         required: true
+
+# env:
+#   AWS_REGION: us-east-1
+#   ECR_REPOSITORY: trading-simulator
+#   HELM_CHART_PATH: helm/banking-app
+#   IMAGE_TAG: ${{ github.event.inputs.image-tag || github.sha }}
+#   CLUSTER_DEV: project-sentinel-dev
+#   CLUSTER_STAGING: project-sentinel-staging
+#   CLUSTER_PROD: project-sentinel-prod
+
+# jobs:
+#   deploy-dev:
+#     name: Deploy Dev
+#     runs-on: ubuntu-latest
+#     environment: dev
+#     steps:
+#       - uses: actions/checkout@v4
+#       - name: Check AWS credentials
+#         id: check-aws
+#         run: |
+#           if [ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ] && [ -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
+#             echo "has_creds=true" >> $GITHUB_OUTPUT
+#           else
+#             echo "has_creds=false" >> $GITHUB_OUTPUT
+#           fi
+#       - name: Deploy to EKS (dev)
+#         if: steps.check-aws.outputs.has_creds == 'true'
+#         uses: ./.github/actions/helm-deploy
+#         with:
+#           aws-region: ${{ env.AWS_REGION }}
+#           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#           cluster-name: ${{ env.CLUSTER_DEV }}
+#           chart-path: ${{ env.HELM_CHART_PATH }}
+#           values-file: ${{ env.HELM_CHART_PATH }}/values-dev.yaml
+#           image-tag: ${{ env.IMAGE_TAG }}
+#       - name: Deploy skipped
+#         if: steps.check-aws.outputs.has_creds == 'false'
+#         run: echo "::warning::AWS credentials not configured — EKS deployment skipped. Configure AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY to enable deployments."
+
+#   deploy-staging:
+#     name: Deploy Staging
+#     needs: deploy-dev
+#     runs-on: ubuntu-latest
+#     environment: staging
+#     steps:
+#       - uses: actions/checkout@v4
+#       - name: Check AWS credentials
+#         id: check-aws
+#         run: |
+#           if [ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ] && [ -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
+#             echo "has_creds=true" >> $GITHUB_OUTPUT
+#           else
+#             echo "has_creds=false" >> $GITHUB_OUTPUT
+#           fi
+#       - name: Deploy to EKS (staging)
+#         if: steps.check-aws.outputs.has_creds == 'true'
+#         uses: ./.github/actions/helm-deploy
+#         with:
+#           aws-region: ${{ env.AWS_REGION }}
+#           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#           cluster-name: ${{ env.CLUSTER_STAGING }}
+#           chart-path: ${{ env.HELM_CHART_PATH }}
+#           values-file: ${{ env.HELM_CHART_PATH }}/values-staging.yaml
+#           image-tag: ${{ env.IMAGE_TAG }}
+#       - name: Deploy skipped
+#         if: steps.check-aws.outputs.has_creds == 'false'
+#         run: echo "::warning::AWS credentials not configured — EKS deployment skipped."
+
+#   deploy-production:
+#     name: Deploy Production
+#     needs: deploy-staging
+#     runs-on: ubuntu-latest
+#     environment: production
+#     steps:
+#       - uses: actions/checkout@v4
+#       - name: Check AWS credentials
+#         id: check-aws
+#         run: |
+#           if [ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ] && [ -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
+#             echo "has_creds=true" >> $GITHUB_OUTPUT
+#           else
+#             echo "has_creds=false" >> $GITHUB_OUTPUT
+#           fi
+#       - name: Deploy to EKS (production)
+#         if: steps.check-aws.outputs.has_creds == 'true'
+#         uses: ./.github/actions/helm-deploy
+#         with:
+#           aws-region: ${{ env.AWS_REGION }}
+#           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#           cluster-name: ${{ env.CLUSTER_PROD }}
+#           chart-path: ${{ env.HELM_CHART_PATH }}
+#           values-file: ${{ env.HELM_CHART_PATH }}/values.yaml
+#           image-tag: ${{ env.IMAGE_TAG }}
+#       - name: Verify rollout
+#         if: steps.check-aws.outputs.has_creds == 'true'
+#         run: kubectl rollout status deployment/trading-simulator -n banking --timeout=5m
+#       - name: Deploy skipped
+#         if: steps.check-aws.outputs.has_creds == 'false'
+#         run: echo "::warning::AWS credentials not configured — production deployment skipped."
+
+#   validate-deployment:
+#     name: Validate Deployment
+#     needs: deploy-production
+#     runs-on: ubuntu-latest
+#     environment: production
+#     defaults:
+#       run:
+#         working-directory: ./app
+#     steps:
+#       - uses: actions/checkout@v4
+#       - name: Check AWS credentials
+#         id: check-aws
+#         run: |
+#           if [ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ] && [ -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
+#             echo "has_creds=true" >> $GITHUB_OUTPUT
+#           else
+#             echo "has_creds=false" >> $GITHUB_OUTPUT
+#           fi
+#       - name: Validate on EKS
+#         if: steps.check-aws.outputs.has_creds == 'true'
+#         uses: ./.github/actions/aws-eks-setup
+#         with:
+#           aws-region: ${{ env.AWS_REGION }}
+#           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#           cluster-name: ${{ env.CLUSTER_PROD }}
+#       - name: Verify pod health
+#         if: steps.check-aws.outputs.has_creds == 'true'
+#         run: |
+#           READY=$(kubectl get deployment trading-simulator -n banking -o jsonpath='{.status.readyReplicas}')
+#           DESIRED=$(kubectl get deployment trading-simulator -n banking -o jsonpath='{.spec.replicas}')
+#           if [ "$READY" != "$DESIRED" ]; then
+#             echo "Deployment validation failed: $READY/$DESIRED pods ready"
+#             exit 1
+#           fi
+#           echo "Deployment validation passed: $READY/$DESIRED pods ready"
+#       - name: Check application health
+#         if: steps.check-aws.outputs.has_creds == 'true'
+#         run: |
+#           POD=$(kubectl get pods -n banking -l app=trading-simulator -o jsonpath='{.items[0].metadata.name}')
+#           kubectl exec -n banking "$POD" -- wget -q -O- http://localhost:3000/health || echo "Health check completed"
+#       - name: Local health check
+#         if: steps.check-aws.outputs.has_creds == 'false'
+#         run: |
+#           npm ci
+#           node -e "
+#             const app = require('./src/index');
+#             const http = require('http');
+#             const server = app.listen(0, () => {
+#               const port = server.address().port;
+#               http.get('http://localhost:' + port + '/health', (res) => {
+#                 let data = '';
+#                 res.on('data', chunk => data += chunk);
+#                 res.on('end', () => {
+#                   console.log('Health check response:', data);
+#                   const parsed = JSON.parse(data);
+#                   if (parsed.status === 'healthy') {
+#                     console.log('Application health check passed');
+#                     server.close(() => process.exit(0));
+#                   } else {
+#                     console.error('Health check failed');
+#                     server.close(() => process.exit(1));
+#                   }
+#                 });
+#               });
+#             });
+#           "
+
+#   rollback:
+#     name: Rollback Production
+#     needs: validate-deployment
+#     if: failure()
+#     runs-on: ubuntu-latest
+#     environment: production
+#     steps:
+#       - uses: actions/checkout@v4
+#       - name: Check AWS credentials
+#         id: check-aws
+#         run: |
+#           if [ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ] && [ -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
+#             echo "has_creds=true" >> $GITHUB_OUTPUT
+#           else
+#             echo "has_creds=false" >> $GITHUB_OUTPUT
+#           fi
+#       - name: Rollback on EKS
+#         if: steps.check-aws.outputs.has_creds == 'true'
+#         uses: ./.github/actions/aws-eks-setup
+#         with:
+#           aws-region: ${{ env.AWS_REGION }}
+#           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#           cluster-name: ${{ env.CLUSTER_PROD }}
+#       - name: Helm rollback
+#         if: steps.check-aws.outputs.has_creds == 'true'
+#         run: helm rollback trading-simulator -n banking
+#       - name: Verify rollback
+#         if: steps.check-aws.outputs.has_creds == 'true'
+#         run: kubectl rollout status deployment/trading-simulator -n banking --timeout=5m
+#       - name: Rollback skipped
+#         if: steps.check-aws.outputs.has_creds == 'false'
+#         run: echo "::warning::AWS credentials not configured — rollback skipped."
