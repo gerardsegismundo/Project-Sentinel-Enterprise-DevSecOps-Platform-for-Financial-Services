@@ -1,0 +1,66 @@
+name: Deploy (Dev & Staging)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ develop ]
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_DEV: project-sentinel-dev
+  CLUSTER_STAGING: project-sentinel-staging
+  ECR_REPOSITORY: trading-simulator
+
+jobs:
+
+  build-push:
+    runs-on: ubuntu-latest
+
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t trading-simulator:${{ github.sha }} ./app
+
+      - name: Set output
+        id: meta
+        run: echo "image=trading-simulator:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+  deploy-dev:
+    needs: build-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy Dev
+        uses: ./.github/actions/helm-deploy
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          cluster-name: ${{ env.CLUSTER_DEV }}
+          chart-path: helm/banking-app
+          values-file: helm/banking-app/values-dev.yaml
+          image-tag: ${{ github.sha }}
+
+  deploy-staging:
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy Staging
+        uses: ./.github/actions/helm-deploy
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          cluster-name: ${{ env.CLUSTER_STAGING }}
+          chart-path: helm/banking-app
+          values-file: helm/banking-app/values-staging.yaml
+          image-tag: ${{ github.sha }}

@@ -1,0 +1,58 @@
+name: Production Release
+
+on:
+  push:
+    branches: [ main, master ]
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_PROD: project-sentinel-prod
+
+jobs:
+
+  deploy-production:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy Production
+        uses: ./.github/actions/helm-deploy
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          cluster-name: ${{ env.CLUSTER_PROD }}
+          chart-path: helm/banking-app
+          values-file: helm/banking-app/values.yaml
+          image-tag: ${{ github.sha }}
+
+      - name: Verify rollout
+        run: kubectl rollout status deployment/trading-simulator -n banking --timeout=5m
+
+  validate-production:
+    needs: deploy-production
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Health check
+        run: |
+          POD=$(kubectl get pods -n banking -l app=trading-simulator -o jsonpath='{.items[0].metadata.name}')
+          kubectl exec -n banking "$POD" -- wget -q -O- http://localhost:3000/health
+
+  rollback:
+    needs: validate-production
+    if: failure()
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rollback
+        run: helm rollback trading-simulator -n banking
+
+      - name: Verify rollback
+        run: kubectl rollout status deployment/trading-simulator -n banking --timeout=5m
