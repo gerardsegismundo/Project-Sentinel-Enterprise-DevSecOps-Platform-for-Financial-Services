@@ -4,16 +4,20 @@ on:
   push:
     branches: [ main, master, develop ]
   pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+env:
+  LOCAL_IMAGE: trading-simulator:${{ github.sha }}
 
 jobs:
-
   secret-scan:
+    name: Secret Scan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - uses: trufflesecurity/truffleHog@main
         with:
           path: ./
@@ -21,96 +25,135 @@ jobs:
           head: HEAD
           extra_args: --only-verified
 
+  sast:
+    name: SAST Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: SonarSource/sonarqube-scan-action@v2
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
   sast-semgrep:
+    name: SAST Scan (Semgrep)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: semgrep/semgrep-action@v1
         with:
-          config: p/security-audit p/secrets p/owasp-top-ten
-
-  sast-sonarqube:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: SonarSource/sonarqube-scan-action@v2
-        if: ${{ env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != '' }}
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          config: >-
+            p/security-audit
+            p/secrets
+            p/owasp-top-ten
 
   dependency-scan:
+    name: Dependency Scan
     runs-on: ubuntu-latest
-    env:
-      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
     defaults:
       run:
         working-directory: ./app
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: npm
+          cache: 'npm'
           cache-dependency-path: ./app/package-lock.json
-
       - run: npm ci
-
-      - name: Snyk scan
-        if: ${{ env.SNYK_TOKEN != '' }}
-        run: npx snyk test --severity-threshold=high
-
-      - name: npm audit fallback
-        if: ${{ env.SNYK_TOKEN == '' }}
-        run: npm audit --audit-level=high || true
+      - name: Snyk dependency scan
+        run: |
+          if [ -n "${{ secrets.SNYK_TOKEN }}" ]; then
+            npx snyk test --severity-threshold=high
+          else
+            npm audit --audit-level=high || true
+          fi
 
   iac-scan:
+    name: IaC Scan
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
-
       - run: terraform fmt -check -recursive terraform/
-
-      - run: terraform -chdir=terraform/environments/dev init -backend=false
-      - run: terraform -chdir=terraform/environments/dev validate
-
-      - run: terraform -chdir=terraform/environments/staging init -backend=false
-      - run: terraform -chdir=terraform/environments/staging validate
-
-      - run: terraform -chdir=terraform/environments/production init -backend=false
-      - run: terraform -chdir=terraform/environments/production validate
-
+      - run: terraform -chdir=terraform/environments/dev/ init -backend=false
+      - run: terraform -chdir=terraform/environments/dev/ validate
+      - run: terraform -chdir=terraform/environments/staging/ init -backend=false
+      - run: terraform -chdir=terraform/environments/staging/ validate
+      - run: terraform -chdir=terraform/environments/production/ init -backend=false
+      - run: terraform -chdir=terraform/environments/production/ validate
       - uses: bridgecrewio/checkov-action@v12
         with:
           directory: terraform/
           framework: terraform
-
+          soft_fail: false
       - uses: aquasecurity/tfsec-action@v1.0.0
         with:
           working_directory: terraform/
           soft_fail: true
 
   container-scan:
+    name: Container Scan (Grype & Trivy)
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Build image
-        run: docker build -t trading-simulator:${{ github.sha }} ./app
-
+      - name: Build Docker image
+        run: docker build -t ${{ env.LOCAL_IMAGE }} ./app
       - name: Install Grype
         run: curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
-
-      - name: Scan with Grype
-        run: grype trading-simulator:${{ github.sha }} --fail-on critical || true
-
-      - uses: aquasecurity/trivy-action@master
+      - name: Scan image with Grype
+        run: grype ${{ env.LOCAL_IMAGE }} --fail-on critical -o json > grype-report.json || true
+      - uses: actions/upload-artifact@v4
         with:
-          image-ref: trading-simulator:${{ github.sha }}
-          severity: CRITICAL,HIGH
+          name: grype-report
+          path: grype-report.json
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@v0.28.0
+        with:
+          input: ${{ env.LOCAL_IMAGE }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+      - name: Trivy SARIF report
+        uses: aquasecurity/trivy-action@v0.28.0
+        with:
+          input: ${{ env.LOCAL_IMAGE }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+      - name: Upload Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  dast-scan:
+    name: DAST Scan (OWASP ZAP)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install ZAP
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zaproxy
+      - name: Start local app
+        working-directory: ./app
+        run: |
+          npm ci
+          node src/index.js &
+          sleep 3
+      - name: Run OWASP ZAP Scan
+        uses: zaproxy/action-full-scan@v0.12.0
+        continue-on-error: true
+        with:
+          target: 'http://localhost:3000'
+          cmd_options: '-a'
+          allow_issue_writing: false
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-report
+          path: report_html.html

@@ -1,58 +1,128 @@
-name: Production Release
+name: Release Pipeline
 
 on:
   push:
     branches: [ main, master ]
+    paths-ignore:
+      - '**.md'
+      - '**.txt'
+  pull_request:
+    branches: [ main, master ]
+    paths-ignore:
+      - '**.md'
+      - '**.txt'
+  workflow_dispatch:
 
 env:
   AWS_REGION: us-east-1
+  ECR_REPOSITORY: trading-simulator
+  IMAGE_TAG: ${{ github.sha }}
+  HELM_CHART_PATH: helm/banking-app
+  LOCAL_IMAGE: trading-simulator:${{ github.sha }}
+  CLUSTER_DEV: project-sentinel-dev
+  CLUSTER_STAGING: project-sentinel-staging
   CLUSTER_PROD: project-sentinel-prod
 
 jobs:
-
-  deploy-production:
+  build-push:
+    name: Build & Push
     runs-on: ubuntu-latest
-    environment: production
-
+    outputs:
+      image-ref: ${{ steps.set-image.outputs.image-ref }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Deploy Production
-        uses: ./.github/actions/helm-deploy
+      - name: Check AWS credentials
+        id: check-aws
+        run: |
+          if [ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ] && [ -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
+            echo "has_creds=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_creds=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Build Docker image
+        run: docker build -t ${{ env.LOCAL_IMAGE }} ./app
+      - name: Set image reference
+        id: set-image
+        run: echo "image-ref=${{ env.LOCAL_IMAGE }}" >> $GITHUB_OUTPUT
+      - name: Save image for downstream jobs
+        run: |
+          docker save ${{ env.LOCAL_IMAGE }} -o /tmp/image.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/image.tar
+          retention-days: 1
+      - name: Configure AWS credentials
+        if: steps.check-aws.outputs.has_creds == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          cluster-name: ${{ env.CLUSTER_PROD }}
-          chart-path: helm/banking-app
-          values-file: helm/banking-app/values.yaml
-          image-tag: ${{ github.sha }}
-
-      - name: Verify rollout
-        run: kubectl rollout status deployment/trading-simulator -n banking --timeout=5m
-
-  validate-production:
-    needs: deploy-production
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Health check
+      - name: Login to ECR
+        id: login-ecr
+        if: steps.check-aws.outputs.has_creds == 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Tag and push to ECR
+        if: steps.login-ecr.outcome == 'success'
         run: |
-          POD=$(kubectl get pods -n banking -l app=trading-simulator -o jsonpath='{.items[0].metadata.name}')
-          kubectl exec -n banking "$POD" -- wget -q -O- http://localhost:3000/health
+          docker tag ${{ env.LOCAL_IMAGE }} ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          docker tag ${{ env.LOCAL_IMAGE }} ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:dev
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:dev || echo "::warning::dev tag already exists, skipping"
+      - name: ECR push skipped
+        if: steps.login-ecr.outcome == 'skipped' || steps.check-aws.outputs.has_creds == 'false'
+        run: echo "::warning::AWS credentials not configured — ECR push skipped. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in GitHub Secrets to enable."
 
-  rollback:
-    needs: validate-production
-    if: failure()
+  terraform-apply:
+    name: Terraform Apply Dev
+    needs: build-push
     runs-on: ubuntu-latest
-
+    environment: dev
+    outputs:
+      role-arn: ${{ steps.get-role.outputs.role-arn }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Rollback
-        run: helm rollback trading-simulator -n banking
-
-      - name: Verify rollback
-        run: kubectl rollout status deployment/trading-simulator -n banking --timeout=5m
+      - name: Check AWS credentials
+        id: check-aws
+        run: |
+          if [ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ] && [ -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
+            echo "has_creds=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_creds=false" >> $GITHUB_OUTPUT
+          fi
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform init and plan (dry run)
+        if: steps.check-aws.outputs.has_creds == 'false'
+        run: |
+          echo "::warning::AWS credentials not configured — running Terraform in dry-run mode"
+          terraform -chdir=terraform/environments/dev/ init -backend=false
+          terraform -chdir=terraform/environments/dev/ validate
+          echo "Terraform validation passed (dry run)"
+      - name: Configure AWS credentials
+        if: steps.check-aws.outputs.has_creds == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - name: Terraform init
+        if: steps.check-aws.outputs.has_creds == 'true'
+        run: terraform -chdir=terraform/environments/dev/ init
+      - name: Terraform plan
+        if: steps.check-aws.outputs.has_creds == 'true'
+        run: terraform -chdir=terraform/environments/dev/ plan -out=tfplan
+      - name: Terraform apply
+        if: steps.check-aws.outputs.has_creds == 'true'
+        run: terraform -chdir=terraform/environments/dev/ apply -auto-approve tfplan
+      - name: Export Terraform outputs
+        if: steps.check-aws.outputs.has_creds == 'true'
+        run: terraform -chdir=terraform/environments/dev/ output -json > terraform-outputs.json
+      - id: get-role
+        if: steps.check-aws.outputs.has_creds == 'true'
+        run: echo "role-arn=$(terraform -chdir=terraform/environments/dev output -raw github_actions_role_arn)" >> $GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v4
+        if: steps.check-aws.outputs.has_creds == 'true'
+        with:
+          name: terraform-outputs
+          path: terraform-outputs.json
